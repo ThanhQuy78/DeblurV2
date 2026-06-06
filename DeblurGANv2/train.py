@@ -11,6 +11,7 @@ if hasattr(ir2, 'pretrained_settings') and 'inceptionresnetv2' in ir2.pretrained
         if 'url' in ir2.pretrained_settings['inceptionresnetv2'][key]:
             ir2.pretrained_settings['inceptionresnetv2'][key]['url'] = 'https://huggingface.co/jscanvic/mirror/resolve/main/inceptionresnetv2-520b38e4.pth'
 
+import contextlib
 from functools import partial
 
 import cv2
@@ -32,6 +33,13 @@ from fire import Fire
 
 cv2.setNumThreads(0)
 
+# Use Ampere+ tensor cores for fp32 matmul/conv (TF32) and let cuDNN pick the
+# fastest conv algorithms for the fixed 256x256 input size. No-ops on older GPUs
+# like P100, so safe to keep on everywhere.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
 
 class Trainer:
     def __init__(self, config, train: DataLoader, val: DataLoader):
@@ -41,10 +49,24 @@ class Trainer:
         self.adv_lambda = config['model']['adv_lambda']
         self.metric_counter = MetricCounter(config['experiment_desc'])
         self.warmup_epochs = config['warmup_num']
+        # How often (in iterations) to compute the slow CPU-side PSNR/SSIM metrics.
+        self.metric_every = config.get('metric_every', 100)
+        # Mixed precision: use bf16 autocast (no GradScaler needed, so it is safe
+        # with the WGAN-GP gradient penalty's double backward). Skipped on GPUs
+        # without bf16 support (e.g. P100), where it would not help anyway.
+        self.use_amp = bool(config.get('amp', True)) and torch.cuda.is_available() \
+            and torch.cuda.is_bf16_supported()
+
+    def _autocast(self):
+        if self.use_amp:
+            return torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+        return contextlib.nullcontext()
 
     def train(self):
         self._init_params()
         start_epoch = self._maybe_resume()
+        print('AMP (bf16 autocast): {} | metrics every {} iters'.format(
+            'ON' if self.use_amp else 'OFF', self.metric_every))
         for epoch in range(start_epoch, self.config['num_epochs']):
             if (epoch == self.warmup_epochs) and not (self.warmup_epochs == 0):
                 self.netG.module.unfreeze()
@@ -72,20 +94,25 @@ class Trainer:
         i = 0
         for data in tq:
             inputs, targets = self.model.get_input(data)
-            outputs = self.netG(inputs)
+            with self._autocast():
+                outputs = self.netG(inputs)
             loss_D = self._update_d(outputs, targets)
             self.optimizer_G.zero_grad()
-            loss_content = self.criterionG(outputs, targets)
-            loss_adv = self.adv_trainer.loss_g(outputs, targets)
-            loss_G = loss_content + self.adv_lambda * loss_adv
+            with self._autocast():
+                loss_content = self.criterionG(outputs, targets)
+                loss_adv = self.adv_trainer.loss_g(outputs, targets)
+                loss_G = loss_content + self.adv_lambda * loss_adv
             loss_G.backward()
             self.optimizer_G.step()
             self.metric_counter.add_losses(loss_G.item(), loss_content.item(), loss_D)
-            curr_psnr, curr_ssim, img_for_vis = self.model.get_images_and_metrics(inputs, outputs, targets)
-            self.metric_counter.add_metrics(curr_psnr, curr_ssim)
+            # PSNR/SSIM are computed on CPU (skimage) and force a GPU->CPU sync,
+            # so only sample them every `metric_every` iterations, not every step.
+            if i % self.metric_every == 0:
+                curr_psnr, curr_ssim, img_for_vis = self.model.get_images_and_metrics(inputs, outputs, targets)
+                self.metric_counter.add_metrics(curr_psnr, curr_ssim)
+                if not i:
+                    self.metric_counter.add_image(img_for_vis, tag='train')
             tq.set_postfix(loss=self.metric_counter.loss_message())
-            if not i:
-                self.metric_counter.add_image(img_for_vis, tag='train')
             i += 1
             if i > epoch_size:
                 break
@@ -100,7 +127,7 @@ class Trainer:
         i = 0
         for data in tq:
             inputs, targets = self.model.get_input(data)
-            with torch.no_grad():
+            with torch.no_grad(), self._autocast():
                 outputs = self.netG(inputs)
                 loss_content = self.criterionG(outputs, targets)
                 loss_adv = self.adv_trainer.loss_g(outputs, targets)
@@ -120,7 +147,8 @@ class Trainer:
         if self.config['model']['d_name'] == 'no_gan':
             return 0
         self.optimizer_D.zero_grad()
-        loss_D = self.adv_lambda * self.adv_trainer.loss_d(outputs, targets)
+        with self._autocast():
+            loss_D = self.adv_lambda * self.adv_trainer.loss_d(outputs, targets)
         loss_D.backward(retain_graph=True)
         self.optimizer_D.step()
         return loss_D.item()

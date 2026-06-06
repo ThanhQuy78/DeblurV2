@@ -5,15 +5,23 @@ from glob import glob
 from hashlib import sha1
 from typing import Callable, Iterable, Optional, Tuple
 
+import logging
+
 import cv2
 import numpy as np
-from glog import logger
 from joblib import Parallel, cpu_count, delayed
 from skimage.io import imread
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
 import aug
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+logger = logging.getLogger(__name__)
 
 
 def subsample(data: Iterable, bounds: Tuple[float, float], hash_fn: Callable, n_buckets=100, salt='', verbose=True):

@@ -8,7 +8,6 @@ joblib
 albumentations>=1.0.0
 scikit-image==0.18.1
 tqdm
-glog
 tensorboardx
 fire
 # this file is not ready yet

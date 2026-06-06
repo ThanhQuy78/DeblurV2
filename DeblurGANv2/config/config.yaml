@@ -5,8 +5,8 @@ experiment_desc: fpn
 train:
 #  files_a: &FILES_A /datasets/my_dataset/**/*.jpg
   #可以使用绝对路径
-  files_a: &FILES_A /kaggle/input/datasets/jesucristo/gopro-data/train/**/blur/*.png
-  files_b: &FILES_B /kaggle/input/datasets/jesucristo/gopro-data/train/**/sharp/*.png
+  files_a: &FILES_A /content/drive/.shortcut-targets-by-id/13ExeFNRbj_BWZA4tksC4g6crEzcCQ2NL/IntroML/datasets/deblurring/train/GoPro/full/input/*.png
+  files_b: &FILES_B /content/drive/.shortcut-targets-by-id/13ExeFNRbj_BWZA4tksC4g6crEzcCQ2NL/IntroML/datasets/deblurring/train/GoPro/full/target/*.png
 #  files_a: &FILES_A ./dataset1/blur/*.png
 #  files_b: &FILES_B ./dataset1/sharp/*.png
   size: &SIZE 256
@@ -49,15 +49,15 @@ model:
   dropout: True
 
 num_epochs: 150
-train_batches_per_epoch: 1000
+train_batches_per_epoch: 500
 val_batches_per_epoch: 100
-batch_size: 1
+batch_size: 4
 image_size: [256, 256]
 
 optimizer:
   name: adam
-  lr: 0.0001
+  lr: 0.0002
 scheduler:
   name: linear
-  start_epoch: num_epochs//2
+  start_epoch: 75
   min_lr: 0.0000001
