@@ -44,7 +44,8 @@ class Trainer:
 
     def train(self):
         self._init_params()
-        for epoch in range(0, self.config['num_epochs']):
+        start_epoch = self._maybe_resume()
+        for epoch in range(start_epoch, self.config['num_epochs']):
             if (epoch == self.warmup_epochs) and not (self.warmup_epochs == 0):
                 self.netG.module.unfreeze()
                 self.optimizer_G = self._get_optim(self.netG.parameters())
@@ -54,13 +55,8 @@ class Trainer:
             self.scheduler_G.step()
             self.scheduler_D.step()
 
-            if self.metric_counter.update_best_model():
-                torch.save({
-                    'model': self.netG.state_dict()
-                }, 'best_{}.h5'.format(self.config['experiment_desc']))
-            torch.save({
-                'model': self.netG.state_dict()
-            }, 'last_{}.h5'.format(self.config['experiment_desc']))
+            is_best = self.metric_counter.update_best_model()
+            self._save_checkpoint(epoch, is_best)
             print(self.metric_counter.loss_message())
             logging.debug("Experiment Name: %s, Epoch: %d, Loss: %s" % (
                 self.config['experiment_desc'], epoch, self.metric_counter.loss_message()))
@@ -180,10 +176,69 @@ class Trainer:
         self.scheduler_G = self._get_scheduler(self.optimizer_G)
         self.scheduler_D = self._get_scheduler(self.optimizer_D)
 
+    def _save_checkpoint(self, epoch, is_best=False):
+        exp = self.config['experiment_desc']
+        state = {
+            'epoch': epoch,
+            'model': self.netG.state_dict(),
+            'optimizer_G': self.optimizer_G.state_dict(),
+            'optimizer_D': self.optimizer_D.state_dict(),
+            'scheduler_G': self.scheduler_G.state_dict(),
+            'scheduler_D': self.scheduler_D.state_dict(),
+            'adv_trainer': self.adv_trainer.state_dict(),
+            'best_metric': self.metric_counter.best_metric,
+        }
+        torch.save(state, 'last_{}.h5'.format(exp))
+        if is_best:
+            # keep best_*.h5 weights-only for compatibility with predict.py
+            torch.save({'model': self.netG.state_dict()}, 'best_{}.h5'.format(exp))
 
-def main(config_path='config/config.yaml'):
+    def _maybe_resume(self):
+        resume_path = self.config.get('resume')
+        if not resume_path and self.config.get('auto_resume', True):
+            default_last = 'last_{}.h5'.format(self.config['experiment_desc'])
+            if os.path.exists(default_last):
+                resume_path = default_last
+        if resume_path and os.path.exists(resume_path):
+            start_epoch = self._load_checkpoint(resume_path)
+            print('Resumed from {} -> starting at epoch {}'.format(resume_path, start_epoch))
+            return start_epoch
+        return 0
+
+    def _load_checkpoint(self, path):
+        checkpoint = torch.load(path, map_location='cuda')
+        self.netG.load_state_dict(checkpoint['model'])
+        start_epoch = checkpoint.get('epoch', -1) + 1
+
+        # If we resume past warmup, the backbone must be unfrozen and the G optimizer/
+        # scheduler rebuilt on the full parameter set *before* loading their states,
+        # because the in-loop unfreeze (epoch == warmup_epochs) will not fire anymore.
+        if self.warmup_epochs and start_epoch > self.warmup_epochs:
+            self.netG.module.unfreeze()
+            self.optimizer_G = self._get_optim(self.netG.parameters())
+            self.scheduler_G = self._get_scheduler(self.optimizer_G)
+
+        if 'optimizer_G' in checkpoint:
+            self.optimizer_G.load_state_dict(checkpoint['optimizer_G'])
+            self.optimizer_D.load_state_dict(checkpoint['optimizer_D'])
+            self.scheduler_G.load_state_dict(checkpoint['scheduler_G'])
+            self.scheduler_D.load_state_dict(checkpoint['scheduler_D'])
+            self.adv_trainer.load_state_dict(checkpoint['adv_trainer'])
+            self.metric_counter.best_metric = checkpoint.get('best_metric', 0)
+        else:
+            print('Checkpoint has weights only (no optimizer state); '
+                  'continuing with fresh optimizer/scheduler.')
+        return start_epoch
+
+
+def main(config_path='config/config.yaml', resume=None, auto_resume=True):
     with open(config_path, 'r',encoding='utf-8') as f:
         config = yaml.load(f, Loader=yaml.SafeLoader)
+
+    # CLI overrides for resume behaviour (Fire maps these to --resume / --auto_resume)
+    if resume is not None:
+        config['resume'] = resume
+    config['auto_resume'] = auto_resume
 
     batch_size = config.pop('batch_size')
     get_dataloader = partial(DataLoader,
